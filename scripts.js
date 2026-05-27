@@ -84,6 +84,7 @@
   var currentName        = '';
   var currentProject     = '';
   var completedProjects  = {};   // { projectName: true }
+  var remoteCompletedProjects = {}; // submitted by any sponsor, loaded from the worker
   var stagedRatings      = {};   // in-progress draft ratings
   var submittedResponses = {};   // full payloads of submitted projects (for report)
 
@@ -245,9 +246,14 @@
     if (!progressCounter) return;
     var entry = sponsorData[currentEmail];
     if (!entry || !entry.projects) { progressCounter.textContent = ''; return; }
-    var total = Object.keys(entry.projects).length;
-    var done  = Object.keys(completedProjects).filter(function (p) { return completedProjects[p]; }).length;
+    var projects = Object.keys(entry.projects);
+    var total = projects.length;
+    var done  = projects.filter(function (p) { return isProjectCompleted(p); }).length;
     progressCounter.textContent = done + ' of ' + total + ' project' + (total !== 1 ? 's' : '') + ' completed';
+  }
+
+  function isProjectCompleted(projectName) {
+    return !!completedProjects[projectName] || !!remoteCompletedProjects[projectName];
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -267,24 +273,25 @@
     var allProjects = Object.keys(entry.projects).slice();
     // Sort: incomplete projects first
     allProjects.sort(function (a, b) {
-      return (completedProjects[a] ? 1 : 0) - (completedProjects[b] ? 1 : 0);
+      return (isProjectCompleted(a) ? 1 : 0) - (isProjectCompleted(b) ? 1 : 0);
     });
 
     allProjects.forEach(function (p) {
-      var isDone = !!completedProjects[p];
+      var isDone = isProjectCompleted(p);
+      var isRemoteOnly = !completedProjects[p] && !!remoteCompletedProjects[p];
 
       var li = el('li', {
         class:       'project-item' + (isDone ? ' completed' : ''),
         tabindex:    isDone ? '-1' : '0',
         'data-project': p,
-        'aria-label': p + (isDone ? ' (completed)' : '')
+        'aria-label': p + (isDone ? ' (already submitted)' : '')
       });
 
       var nameSpan = el('span', { class: 'project-item-name', text: p });
       li.appendChild(nameSpan);
 
       if (isDone) {
-        li.appendChild(el('span', { class: 'meta', text: '\u2713 Completed' }));
+        li.appendChild(el('span', { class: 'meta', text: isRemoteOnly ? '\u2713 Already submitted' : '\u2713 Completed' }));
       } else {
         li.appendChild(el('span', { class: 'project-item-arrow', text: '\u2192' }));
       }
@@ -323,24 +330,54 @@
   // VALIDATION – ensure each criterion has at least one rating
   // (student OR team-overall counts for that criterion)
   // ─────────────────────────────────────────────────────────────────────────────
-  function validateRatings(students) {
-    var issues = [];
-    for (var c = 0; c < RUBRIC.length; c++) {
-      var teamRated = !!document.querySelector('input[name="rating-' + c + '-team"]:checked');
-      if (teamRated) continue; // team row covers this criterion
+  function getRatingMode(students) {
+    var hasStudentRatings = false;
+    var hasTeamRatings = false;
 
-      var anyStudentRated = false;
+    for (var c = 0; c < RUBRIC.length; c++) {
+      if (document.querySelector('input[name="rating-' + c + '-team"]:checked')) {
+        hasTeamRatings = true;
+      }
       for (var s = 0; s < students.length; s++) {
         if (document.querySelector('input[name="rating-' + c + '-' + s + '"]:checked')) {
-          anyStudentRated = true;
-          break;
+          hasStudentRatings = true;
         }
       }
-      if (!anyStudentRated) {
-        var shortTitle = RUBRIC[c].title.length > 30
-          ? RUBRIC[c].title.slice(0, 30) + '\u2026'
-          : RUBRIC[c].title;
-        issues.push('Criterion ' + (c + 1) + ' \u2013 ' + shortTitle);
+    }
+
+    if (hasStudentRatings && hasTeamRatings) return { mode: 'mixed' };
+    if (hasTeamRatings) return { mode: 'team' };
+    if (hasStudentRatings) return { mode: 'individual' };
+    return { mode: 'empty' };
+  }
+
+  function validateRatings(students, ratingMode) {
+    var issues = [];
+    var mode = (ratingMode && ratingMode.mode) || getRatingMode(students).mode;
+
+    if (mode === 'empty') {
+      issues.push('Choose either individual student ratings or the Team Overall row.');
+      return issues;
+    }
+
+    if (mode === 'mixed') {
+      issues.push('Choose one rating method: individual students or Team Overall, not both.');
+      return issues;
+    }
+
+    for (var c = 0; c < RUBRIC.length; c++) {
+      if (mode === 'team') {
+        if (!document.querySelector('input[name="rating-' + c + '-team"]:checked')) {
+          issues.push('Missing Team Overall score for "' + RUBRIC[c].title + '".');
+          return issues;
+        }
+      } else {
+        for (var s = 0; s < students.length; s++) {
+          if (!document.querySelector('input[name="rating-' + c + '-' + s + '"]:checked')) {
+            issues.push('Missing score for ' + students[s] + ' on "' + RUBRIC[c].title + '".');
+            return issues;
+          }
+        }
       }
     }
     return issues;
@@ -368,8 +405,7 @@
     }));
     info.appendChild(el('div', {
       class: 'matrix-info-desc',
-      text: 'Rate each student (1\u20137) or use the Team Overall row to rate the group as a whole. ' +
-            'For each criterion, at least one row must have a rating.'
+      text: 'Rate either every student (1\u20137) or only the Team Overall row. Do not use both methods for the same project.'
     }));
 
     if (matrixContainer && matrixContainer.parentNode) {
@@ -667,41 +703,39 @@
     // Snapshot draft before validation
     saveDraftHandler();
 
-    // Validate completeness
-    var issues = validateRatings(students);
+    // Validate completeness and rating mode
+    var ratingMode = getRatingMode(students);
+    var issues = validateRatings(students, ratingMode);
     if (issues.length) {
-      setStatus('Please complete all criteria before submitting. Missing: ' + issues[0], 'error');
+      setStatus('Please complete the evaluation before submitting. ' + issues[0], 'error');
       return;
     }
 
-    // Build individual-student response rows
     var responses = [];
-    for (var s = 0; s < students.length; s++) {
-      var ratingsObj = {};
-      for (var c = 0; c < RUBRIC.length; c++) {
-        var sel = document.querySelector('input[name="rating-' + c + '-' + s + '"]:checked');
-        ratingsObj[RUBRIC[c].title] = sel ? parseInt(sel.value, 10) : null;
-      }
-      responses.push({
-        student:           students[s],
-        ratings:           ratingsObj,
-        commentShared:     (document.getElementById('comment-public-'  + s) || {}).value || '',
-        commentInstructor: (document.getElementById('comment-private-' + s) || {}).value || '',
-        isTeam:            false
-      });
-    }
 
-    // Team overall row (optional)
-    var teamRatingsObj = {};
-    var teamRated = false;
-    for (var tc = 0; tc < RUBRIC.length; tc++) {
-      var tSel = document.querySelector('input[name="rating-' + tc + '-team"]:checked');
-      teamRatingsObj[RUBRIC[tc].title] = tSel ? parseInt(tSel.value, 10) : null;
-      if (tSel) teamRated = true;
-    }
-    var gpPub  = (document.getElementById('comment-group-public')  || {}).value || '';
-    var gpPriv = (document.getElementById('comment-group-private') || {}).value || '';
-    if (teamRated || gpPub || gpPriv) {
+    if (ratingMode.mode === 'individual') {
+      for (var s = 0; s < students.length; s++) {
+        var ratingsObj = {};
+        for (var c = 0; c < RUBRIC.length; c++) {
+          var sel = document.querySelector('input[name="rating-' + c + '-' + s + '"]:checked');
+          ratingsObj[RUBRIC[c].title] = sel ? parseInt(sel.value, 10) : null;
+        }
+        responses.push({
+          student:           students[s],
+          ratings:           ratingsObj,
+          commentShared:     (document.getElementById('comment-public-'  + s) || {}).value || '',
+          commentInstructor: (document.getElementById('comment-private-' + s) || {}).value || '',
+          isTeam:            false
+        });
+      }
+    } else if (ratingMode.mode === 'team') {
+      var teamRatingsObj = {};
+      for (var tc = 0; tc < RUBRIC.length; tc++) {
+        var tSel = document.querySelector('input[name="rating-' + tc + '-team"]:checked');
+        teamRatingsObj[RUBRIC[tc].title] = tSel ? parseInt(tSel.value, 10) : null;
+      }
+      var gpPub  = (document.getElementById('comment-group-public')  || {}).value || '';
+      var gpPriv = (document.getElementById('comment-group-private') || {}).value || '';
       responses.push({
         student:           'Team Overall',
         ratings:           teamRatingsObj,
@@ -711,10 +745,11 @@
       });
     }
 
+    var submittingProject = currentProject;
     var payload = {
       sponsorName:  currentName,
       sponsorEmail: currentEmail,
-      project:      currentProject,
+      project:      submittingProject,
       surveyRound:  ROUND,
       rubric:       RUBRIC.map(function (r) { return r.title; }),
       responses:    responses,
@@ -722,7 +757,7 @@
     };
 
     // Cache payload for report generation before the async call
-    submittedResponses[currentProject] = payload;
+    submittedResponses[submittingProject] = payload;
     saveProgress();
 
     setStatus('Submitting\u2026', 'info');
@@ -736,29 +771,25 @@
     .then(function (resp) {
       if (!resp.ok) {
         return resp.text().then(function (txt) {
-          throw new Error('Server error ' + resp.status + ': ' + txt);
+          var parsed = null;
+          try { parsed = JSON.parse(txt); } catch (_) {}
+          var err = new Error('Server error ' + resp.status + ': ' + txt);
+          if (parsed && parsed.alreadySubmitted) {
+            err.alreadySubmitted = true;
+            err.project = parsed.project || submittingProject;
+          }
+          throw err;
         });
       }
       return resp.json().catch(function () { return {}; });
     })
     .then(function () {
-      completedProjects[currentProject] = true;
-      delete stagedRatings[currentProject];
+      completedProjects[submittingProject] = true;
+      remoteCompletedProjects[submittingProject] = true;
+      delete stagedRatings[submittingProject];
       saveProgress();
 
-      // Mark item in project list
-      if (projectListEl) {
-        var li = projectListEl.querySelector('li[data-project="' + cssEscape(currentProject) + '"]');
-        if (li) {
-          li.className = 'project-item completed';
-          li.setAttribute('tabindex', '-1');
-          li.innerHTML =
-            '<span class="project-item-name">' + escapeHtml(currentProject) + '</span>' +
-            '<span class="meta">\u2713 Completed</span>';
-        }
-      }
-
-      // Clear matrix UI
+      populateProjectListFor(currentEmail);
       clearMatrixUI();
       updateProgressCounter();
       setStatus('Submitted! Select your next project or click "Submit ratings for project" when done.', 'success');
@@ -769,6 +800,20 @@
     })
     .catch(function (err) {
       console.error('Submission error', err);
+      if (err && err.alreadySubmitted) {
+        completedProjects[submittingProject] = true;
+        remoteCompletedProjects[submittingProject] = true;
+        delete stagedRatings[submittingProject];
+        saveProgress();
+        populateProjectListFor(currentEmail);
+        clearMatrixUI();
+        updateProgressCounter();
+        setStatus('This project was already submitted by another sponsor, so it is marked complete here.', 'info');
+        if (hasCompletedAllProjects()) {
+          setTimeout(showThankyouStage, 1000);
+        }
+        return;
+      }
       setStatus('Submission failed. Check your connection and try again.', 'error');
     })
     .finally(function () {
@@ -790,7 +835,7 @@
     var all   = Object.keys(entry.projects || {});
     if (!all.length) return false;
     for (var i = 0; i < all.length; i++) {
-      if (!completedProjects[all[i]]) return false;
+      if (!isProjectCompleted(all[i])) return false;
     }
     return true;
   }
@@ -933,16 +978,14 @@
           setStatus('No projects found for that email address. Please check and try again.', 'error');
           return;
         }
-        showProjectsStage();
-        populateProjectListFor(currentEmail);
+        showProjectsForCurrentEmail();
       });
     } else {
       if (!sponsorData[currentEmail]) {
         setStatus('No projects found for that email address. Please check and try again.', 'error');
         return;
       }
-      showProjectsStage();
-      populateProjectListFor(currentEmail);
+      showProjectsForCurrentEmail();
     }
   }
 
@@ -1037,6 +1080,43 @@
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
+  function fetchCompletionStatus(callback) {
+    fetch(ENDPOINT_URL + '?status=1&round=' + encodeURIComponent(ROUND), { cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('Completion status returned HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (json) {
+        var next = {};
+        var source = (json && json.completedProjects) || {};
+        if (Array.isArray(source)) {
+          source.forEach(function (projectName) {
+            if (projectName) next[projectName] = true;
+          });
+        } else {
+          Object.keys(source).forEach(function (projectName) {
+            if (source[projectName]) next[projectName] = true;
+          });
+        }
+        remoteCompletedProjects = next;
+        updateProgressCounter();
+      })
+      .catch(function (err) {
+        console.info('Shared completion status unavailable', err);
+      })
+      .finally(function () {
+        if (typeof callback === 'function') callback();
+      });
+  }
+
+  function showProjectsForCurrentEmail() {
+    fetchCompletionStatus(function () {
+      showProjectsStage();
+      populateProjectListFor(currentEmail);
+      if (hasCompletedAllProjects()) showThankyouStage();
+    });
+  }
+
   // BOOT SEQUENCE
   // ─────────────────────────────────────────────────────────────────────────────
   showIdentityStage();
@@ -1044,9 +1124,11 @@
 
   // Load data in background; if user had saved progress, show a "welcome back" hint
   tryFetchData(function () {
-    if (hadProgress && currentEmail && sponsorData[currentEmail]) {
-      setStatus('Welcome back! Your previous progress has been restored. Click Continue to resume.', 'success');
-    }
+    fetchCompletionStatus(function () {
+      if (hadProgress && currentEmail && sponsorData[currentEmail]) {
+        setStatus('Welcome back! Your previous progress has been restored. Click Continue to resume.', 'success');
+      }
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1122,12 +1204,12 @@
     get sponsorData()        { return sponsorData; },
     get stagedRatings()      { return stagedRatings; },
     get completedProjects()  { return completedProjects; },
+    get remoteCompletedProjects() { return remoteCompletedProjects; },
     get submittedResponses() { return submittedResponses; },
     get storageKey()         { return STORAGE_KEY; },
     reloadData:     tryFetchData,
+    reloadCompletionStatus: fetchCompletionStatus,
     generateReport: generateReportHTML
   };
 
 })();
-
-

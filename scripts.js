@@ -1113,7 +1113,9 @@
     fetchCompletionStatus(function () {
       showProjectsStage();
       populateProjectListFor(currentEmail);
-      if (hasCompletedAllProjects()) showThankyouStage();
+      if (hasCompletedAllProjects()) {
+        setStatus('All assigned projects have already been submitted. Completed projects are shown below.', 'info');
+      }
     });
   }
 
